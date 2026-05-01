@@ -1,7 +1,10 @@
+let cachedAccessToken = null;
+let tokenExpiresAt = 0;
+
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     try {
-      return await handleRequest(request, env);
+      return await handleRequest(request, env, ctx);
     } catch (err) {
       return json({ ok: false, error: String(err?.message || err) }, 500);
     }
@@ -11,7 +14,7 @@ export default {
 const COOKIE_NAME = "media_session";
 const CHUNK_SIZE_HINT = 5 * 1024 * 1024;
 
-async function handleRequest(request, env) {
+async function handleRequest(request, env, ctx) {
   const url = new URL(request.url);
   const path = url.pathname;
 
@@ -110,7 +113,7 @@ async function handleRequest(request, env) {
   if (request.method === "GET" && path.startsWith("/file/")) {
     const fileId = decodeURIComponent(path.replace("/file/", ""));
     const accessToken = await getGoogleAccessToken(env);
-    return await streamDriveFile(accessToken, fileId, request);
+    return await streamDriveFile(accessToken, fileId, request, ctx);
   }
 
   if (request.method === "POST" && path === "/api/batch/delete") {
@@ -136,6 +139,10 @@ async function handleRequest(request, env) {
 }
 
 async function getGoogleAccessToken(env) {
+  if (cachedAccessToken && Date.now() < tokenExpiresAt) {
+    return cachedAccessToken;
+  }
+
   const required = [
     "GOOGLE_CLIENT_ID",
     "GOOGLE_CLIENT_SECRET",
@@ -167,7 +174,10 @@ async function getGoogleAccessToken(env) {
     throw new Error(`Google token error: ${JSON.stringify(data)}`);
   }
 
-  return data.access_token;
+  cachedAccessToken = data.access_token;
+  tokenExpiresAt = Date.now() + (data.expires_in - 60) * 1000;
+
+  return cachedAccessToken;
 }
 
 async function listDriveFiles(env, accessToken, keyword, type) {
@@ -322,7 +332,16 @@ async function uploadChunkToGoogle(uploadUrl, body, contentRange, contentType) {
   };
 }
 
-async function streamDriveFile(accessToken, fileId, request) {
+async function streamDriveFile(accessToken, fileId, request, ctx) {
+  const cache = caches.default;
+  const cacheUrl = new URL(request.url);
+  const cacheKey = new Request(cacheUrl.toString(), request);
+
+  let cachedResponse = await cache.match(cacheKey);
+  if (cachedResponse) {
+    return cachedResponse;
+  }
+
   const meta = await getDriveFileMeta(accessToken, fileId);
 
   const headers = {
@@ -330,7 +349,6 @@ async function streamDriveFile(accessToken, fileId, request) {
   };
 
   const range = request.headers.get("Range");
-
   if (range) {
     headers.Range = range;
   }
@@ -342,7 +360,6 @@ async function streamDriveFile(accessToken, fileId, request) {
 
   if (!res.ok && res.status !== 206) {
     const text = await res.text();
-
     return new Response(`读取文件失败：${text}`, {
       status: res.status,
       headers: {
@@ -352,16 +369,21 @@ async function streamDriveFile(accessToken, fileId, request) {
   }
 
   const responseHeaders = new Headers(res.headers);
-
   responseHeaders.set("Content-Type", meta.mimeType || "application/octet-stream");
   responseHeaders.set("Content-Disposition", makeInlineDisposition(meta.name || "file"));
-  responseHeaders.set("Cache-Control", "private, max-age=3600");
+  responseHeaders.set("Cache-Control", "public, max-age=2592000, s-maxage=2592000");
   responseHeaders.set("Accept-Ranges", "bytes");
 
-  return new Response(res.body, {
+  const finalResponse = new Response(res.body, {
     status: res.status,
     headers: responseHeaders
   });
+
+  if (res.status === 200 && ctx) {
+    ctx.waitUntil(cache.put(cacheKey, finalResponse.clone()));
+  }
+
+  return finalResponse;
 }
 
 async function getDriveFileMeta(accessToken, fileId) {
@@ -453,6 +475,7 @@ function sanitizeAppProperties(obj) {
   return out;
 }
 
+// 后端 pad2
 function pad2(n) {
   return String(n).padStart(2, "0");
 }
@@ -527,7 +550,9 @@ function json(data, status = 200, extraHeaders = {}) {
 function html(content) {
   return new Response(content, {
     headers: {
-      "Content-Type": "text/html; charset=utf-8"
+      "Content-Type": "text/html; charset=utf-8",
+      "X-Frame-Options": "DENY",
+      "X-Content-Type-Options": "nosniff"
     }
   });
 }
@@ -677,6 +702,43 @@ const INDEX_HTML = `<!DOCTYPE html>
       display: grid;
       grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
       gap: 18px;
+    }
+
+    .folder-card {
+      background: white;
+      border-radius: 16px;
+      padding: 18px;
+      box-shadow: 0 4px 12px rgba(0,0,0,.05);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      border: 1px solid #eef0f3;
+      transition: transform 0.2s, box-shadow 0.2s;
+    }
+
+    .folder-card:hover {
+      transform: translateY(-3px);
+      box-shadow: 0 8px 24px rgba(0,0,0,.08);
+    }
+
+    .folder-icon {
+      font-size: 38px;
+    }
+
+    .folder-info {
+      flex: 1;
+    }
+
+    .folder-name {
+      font-weight: 800;
+      font-size: 16px;
+      margin-bottom: 4px;
+    }
+
+    .folder-count {
+      font-size: 13px;
+      color: #6b7280;
     }
 
     .item {
@@ -1071,8 +1133,8 @@ const INDEX_HTML = `<!DOCTYPE html>
         <div class="toolbar">
           <input id="searchInput" type="text" placeholder="搜索文件名，例如 IMG、mp4、jpg" />
           <select id="viewMode">
-            <option value="timeline">时间轴</option>
-            <option value="grid">普通网格</option>
+            <option value="folder">日期文件夹视图</option>
+            <option value="grid">全部文件平铺</option>
           </select>
           <button id="refreshBtn" type="button">搜索/刷新</button>
           <button id="clearSearchBtn" class="secondary" type="button">清空</button>
@@ -1098,6 +1160,7 @@ const INDEX_HTML = `<!DOCTYPE html>
     var currentType = "all";
     var currentFiles = [];
     var selectedIds = new Set();
+    var currentFolderKey = null; 
     var DEFAULT_CHUNK_SIZE = 5 * 1024 * 1024;
 
     document.addEventListener("DOMContentLoaded", function () {
@@ -1130,7 +1193,10 @@ const INDEX_HTML = `<!DOCTYPE html>
         if (event.key === "Enter") loadFiles();
       });
 
-      qs("viewMode").addEventListener("change", renderFiles);
+      qs("viewMode").addEventListener("change", function() {
+        currentFolderKey = null;
+        renderFiles();
+      });
 
       document.querySelectorAll(".tab").forEach(function (btn) {
         btn.addEventListener("click", function () {
@@ -1299,6 +1365,8 @@ const INDEX_HTML = `<!DOCTYPE html>
         if (!data.ok) {
           msg.classList.add("error");
           msg.textContent = data.error || "登录失败";
+          await sleep(2000); 
+          loginBtn.disabled = false;
           return;
         }
 
@@ -1359,6 +1427,7 @@ const INDEX_HTML = `<!DOCTYPE html>
 
     function setType(type) {
       currentType = type;
+      currentFolderKey = null; 
 
       document.querySelectorAll(".tab").forEach(function (btn) {
         btn.classList.toggle("active", btn.dataset.type === type);
@@ -1370,6 +1439,7 @@ const INDEX_HTML = `<!DOCTYPE html>
 
     function clearSearch() {
       qs("searchInput").value = "";
+      currentFolderKey = null;
       loadFiles();
     }
 
@@ -1462,8 +1532,8 @@ const INDEX_HTML = `<!DOCTYPE html>
 
       container.innerHTML = "";
 
-      if (qs("viewMode").value === "timeline") {
-        renderTimeline(container);
+      if (qs("viewMode").value === "folder") {
+        renderFolderView(container);
       } else {
         var grid = createEl("div", "grid");
         currentFiles.forEach(function (file) {
@@ -1475,27 +1545,63 @@ const INDEX_HTML = `<!DOCTYPE html>
       restoreCheckboxes();
     }
 
-    function renderTimeline(container) {
+    function renderFolderView(container) {
       var groups = {};
-
-      currentFiles.forEach(function (file) {
+      
+      currentFiles.forEach(function(file) {
         var d = file.createdTime ? new Date(file.createdTime) : new Date();
-        var key = d.getFullYear() + " 年 " + (d.getMonth() + 1) + " 月";
+        var key = d.getFullYear() + "年" + pad2(d.getMonth() + 1) + "月" + pad2(d.getDate()) + "日";
         if (!groups[key]) groups[key] = [];
         groups[key].push(file);
       });
 
-      Object.keys(groups).forEach(function (title) {
-        var titleEl = createEl("div", "timeline-title", title);
+      if (currentFolderKey && groups[currentFolderKey]) {
+        var backBtn = createEl("button", "secondary", "🔙 返回文件夹列表");
+        backBtn.style.marginBottom = "16px";
+        backBtn.onclick = function() {
+          currentFolderKey = null;
+          renderFiles(); 
+        };
+        
+        var title = createEl("div", "timeline-title", currentFolderKey + " (共 " + groups[currentFolderKey].length + " 个文件)");
         var grid = createEl("div", "grid");
-
-        groups[title].forEach(function (file) {
+        
+        groups[currentFolderKey].forEach(function(file) {
           grid.appendChild(createFileCard(file));
         });
-
-        container.appendChild(titleEl);
+        
+        container.appendChild(backBtn);
+        container.appendChild(title);
         container.appendChild(grid);
-      });
+      } else {
+        var grid = createEl("div", "grid");
+        
+        var sortedKeys = Object.keys(groups).sort(function(a, b) {
+           return b.localeCompare(a); 
+        });
+        
+        sortedKeys.forEach(function(key) {
+          var folder = createEl("div", "folder-card");
+          var icon = createEl("div", "folder-icon", "📁");
+          var info = createEl("div", "folder-info");
+          var name = createEl("div", "folder-name", key);
+          var count = createEl("div", "folder-count", "包含 " + groups[key].length + " 个文件");
+          
+          info.appendChild(name);
+          info.appendChild(count);
+          folder.appendChild(icon);
+          folder.appendChild(info);
+          
+          folder.onclick = function() {
+            currentFolderKey = key;
+            renderFiles();
+          };
+          
+          grid.appendChild(folder);
+        });
+        
+        container.appendChild(grid);
+      }
     }
 
     function createFileCard(file) {
@@ -1528,7 +1634,7 @@ const INDEX_HTML = `<!DOCTYPE html>
           var v = document.createElement("video");
           v.src = "/file/" + encodeURIComponent(file.motion.id);
           v.controls = true;
-          v.preload = "metadata";
+          v.preload = "none";
           preview.appendChild(v);
         } else {
           preview.appendChild(createEl("div", "icon", "◎"));
@@ -1549,7 +1655,7 @@ const INDEX_HTML = `<!DOCTYPE html>
           var v2 = document.createElement("video");
           v2.src = url;
           v2.controls = true;
-          v2.preload = "metadata";
+          v2.preload = "none";
           preview.appendChild(v2);
         } else {
           preview.appendChild(createEl("div", "icon", "📄"));
@@ -1561,13 +1667,13 @@ const INDEX_HTML = `<!DOCTYPE html>
       var info = createEl("div", "info");
       var name = createEl("div", "name", file.name || "-");
       name.title = file.name || "-";
-
+      
       var meta = createEl(
         "div",
         "meta",
         "类型：" + (isLive ? "Live Photo" : (file.mimeType || "-")) + "\\n" +
         "大小：" + (file.size ? formatSize(Number(file.size)) : "-") + "\\n" +
-        "时间：" + (file.createdTime ? new Date(file.createdTime).toLocaleString() : "-")
+        "上传：" + (file.createdTime ? new Date(file.createdTime).toLocaleString() : "-")
       );
       meta.innerHTML = meta.textContent.replaceAll("\\n", "<br>");
 
@@ -1607,7 +1713,7 @@ const INDEX_HTML = `<!DOCTYPE html>
       video.playsInline = true;
       video.setAttribute("playsinline", "");
       video.setAttribute("webkit-playsinline", "");
-      video.preload = "metadata";
+      video.preload = "none";
 
       var hint = createEl("div", "live-hint", "点击播放");
 
@@ -1857,7 +1963,7 @@ const INDEX_HTML = `<!DOCTYPE html>
       await loadFiles();
     }
 
-    function uploadChunkWithProgress(options) {
+    function uploadChunkWithProgress(options, attempt = 1) {
       return new Promise(function (resolve, reject) {
         var uploadUrl = options.uploadUrl;
         var chunk = options.chunk;
@@ -1890,7 +1996,6 @@ const INDEX_HTML = `<!DOCTYPE html>
             "已上传：" + formatSize(currentLoaded) + " / " + formatSize(total) + " ｜ " +
             "当前分片：" + formatSize(end - offset) + " ｜ " +
             "实时速度：" + formatSpeed(instantSpeed) + " ｜ " +
-            "平均速度：" + formatSpeed(avgSpeed) + " ｜ " +
             "预计剩余：" + formatDuration(remainSeconds);
 
           stat.lastTime = now;
@@ -1916,8 +2021,19 @@ const INDEX_HTML = `<!DOCTYPE html>
           resolve(data);
         };
 
-        xhr.onerror = function () {
-          reject(new Error("网络错误，分片上传失败"));
+        xhr.onerror = async function () {
+          if (attempt <= 3) {
+            line.textContent = "网络断开，正在重试 (" + attempt + "/3)...";
+            await sleep(2000);
+            try {
+              const res = await uploadChunkWithProgress(options, attempt + 1);
+              resolve(res);
+            } catch (e) {
+              reject(e);
+            }
+          } else {
+            reject(new Error("网络错误，分片上传多次重试均失败"));
+          }
         };
 
         xhr.onabort = function () {
@@ -2032,8 +2148,8 @@ const INDEX_HTML = `<!DOCTYPE html>
     }
 
     function selectAllVisible() {
-      currentFiles.forEach(function (file) {
-        selectedIds.add(file.id);
+      document.querySelectorAll(".select-box").forEach(function (box) {
+        selectedIds.add(box.dataset.id);
       });
       restoreCheckboxes();
       updateSelectedCount();
@@ -2290,7 +2406,7 @@ const INDEX_HTML = `<!DOCTYPE html>
           var v = document.createElement("video");
           v.src = "/file/" + encodeURIComponent(file.motion.id);
           v.controls = true;
-          v.preload = "metadata";
+          v.preload = "none";
           preview.appendChild(v);
         }
       } else {
@@ -2305,7 +2421,7 @@ const INDEX_HTML = `<!DOCTYPE html>
           var v2 = document.createElement("video");
           v2.src = url;
           v2.controls = true;
-          v2.preload = "metadata";
+          v2.preload = "none";
           preview.appendChild(v2);
         } else {
           preview.appendChild(createEl("div", "", "📄"));
@@ -2317,8 +2433,8 @@ const INDEX_HTML = `<!DOCTYPE html>
 
       addRow(table, "类型", file.isLive ? "Live Photo" : (file.mimeType || "-"));
       addRow(table, "大小", file.size ? formatSize(Number(file.size)) : "-");
-      addRow(table, "创建时间", file.createdTime ? new Date(file.createdTime).toLocaleString() : "-");
-      addRow(table, "修改时间", file.modifiedTime ? new Date(file.modifiedTime).toLocaleString() : "-");
+      addRow(table, "上传时间", file.createdTime ? new Date(file.createdTime).toLocaleString() : "-");
+      addRow(table, "网盘修改时间", file.modifiedTime ? new Date(file.modifiedTime).toLocaleString() : "-");
       addRow(table, "链接", targets.map(function (t) { return location.origin + "/file/" + t.id; }).join("\\n"));
 
       var actions = createEl("div", "actions");
@@ -2397,6 +2513,11 @@ const INDEX_HTML = `<!DOCTYPE html>
         .replaceAll(">", "&gt;")
         .replaceAll('"', "&quot;")
         .replaceAll("'", "&#039;");
+    }
+
+    // 新增前端使用的 pad2 工具函数
+    function pad2(n) {
+      return String(n).padStart(2, "0");
     }
 
     function sleep(ms) {
